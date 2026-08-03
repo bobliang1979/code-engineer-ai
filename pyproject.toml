@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "code-benchmark"
+version = "0.1.0"
+description = "代码工程师能力基准 — 4 维评测 (correctness/maintainability/regression/coverage)"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+code-benchmark = "code_benchmark.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
