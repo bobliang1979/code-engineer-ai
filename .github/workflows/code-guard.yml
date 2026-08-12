@@ -1,0 +1,18 @@
+name: code-guard
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # 真实仓库引用 code-guard action (跨仓库消费验证)
+      - uses: bobliang1979/code-guard@v0.2.0
+        with:
+          require-tests: 'false'
