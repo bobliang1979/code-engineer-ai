@@ -1,5 +1,7 @@
 """自主编码智能体主循环: plan → implement → verify → fix → memorize。
-证据门控: 无测试通过 = 不宣称完成。失败教训入库, 下次召回避免重犯 (NFWST)。
+
+证据门控: 无测试通过 = 不宣称完成。失败教训入库, 下次召回注入生成上下文 (NFWST)。
+Capability gate: benchmark 分数不升即回滚 — 越修越坏的改动不留存。
 """
 
 from __future__ import annotations
@@ -9,8 +11,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .ladder import ladder_report
 from .llm import Generator
 from .memory import FailureMemory
+from .patch import PatchOp, apply_patch_ops
 from .verifier import VerifyResult, Verifier
 
 
@@ -19,6 +23,7 @@ class AgentReport:
     task: str
     rounds: int = 0
     ok: bool = False
+    rollback: bool = False
     verify: VerifyResult = field(default_factory=VerifyResult)
     plan: str = ""
     lessons_recalled: list[dict] = field(default_factory=list)
@@ -31,8 +36,11 @@ class AgentReport:
             "task": self.task,
             "ok": self.ok,
             "rounds": self.rounds,
+            "rollback": self.rollback,
             "benchmark_before": self.verify.benchmark_before,
             "benchmark_after": self.verify.benchmark_after,
+            "ladder": ladder_report(self.verify.benchmark_before,
+                                    self.verify.benchmark_after),
             "tests": {"passed": self.verify.passed, "failed": self.verify.failed,
                       "errors": self.verify.errors},
             "import_errors": self.verify.import_errors,
@@ -47,12 +55,16 @@ class AgentReport:
 class CodeAgent:
     def __init__(self, repo: str | Path, generator: Generator,
                  memory: FailureMemory | None = None,
-                 max_rounds: int = 5, verifier: Verifier | None = None):
+                 max_rounds: int = 5, verifier: Verifier | None = None,
+                 auto_rollback: bool = True):
         self.repo = Path(repo)
         self.generator = generator
         self.memory = memory or FailureMemory(self.repo / ".agent_memory.jsonl")
         self.max_rounds = max_rounds
         self.verifier = verifier or Verifier(self.repo)
+        self.auto_rollback = auto_rollback
+
+    # ---------- 上下文 ----------
 
     def _context(self, task: str, round_no: int, last_result: VerifyResult | None) -> dict:
         ctx: dict = {"task": task, "round": round_no, "repo": str(self.repo)}
@@ -62,6 +74,8 @@ class CodeAgent:
             {"path": str(p.relative_to(self.repo)), "size": p.stat().st_size}
             for p in files[:50]
         ]
+        # NFWST: 历史失败教训注入下一轮生成 (修复: 此前 lessons 从未进上下文)
+        ctx["lessons"] = self.memory.recall(task)
         if last_result:
             ctx["last_verification"] = {
                 "passed": last_result.passed, "failed": last_result.failed,
@@ -71,10 +85,62 @@ class CodeAgent:
             }
         return ctx
 
+    # ---------- 快照 / 回滚 (capability-gated) ----------
+
+    def _snapshot(self) -> dict[str, str]:
+        """全部源码文件内容快照 (排除 .venv/.git/教训库)。"""
+        snap: dict[str, str] = {}
+        for p in self.repo.rglob("*.py"):
+            if ".venv" in p.parts or ".git" in p.parts:
+                continue
+            rel = str(p.relative_to(self.repo))
+            if rel.startswith(".agent_memory"):
+                continue
+            snap[rel] = p.read_text(encoding="utf-8", errors="replace")
+        return snap
+
+    def _restore(self, snapshot: dict[str, str]) -> list[str]:
+        """回滚到快照: 改回旧内容, 删除快照里不存在的新文件。"""
+        restored: list[str] = []
+        for rel, content in snapshot.items():
+            target = self.repo / rel
+            if not target.exists() or target.read_text(encoding="utf-8") != content:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+                restored.append(rel)
+        for p in list(self.repo.rglob("*.py")):
+            if ".venv" in p.parts or ".git" in p.parts:
+                continue
+            rel = str(p.relative_to(self.repo))
+            if rel not in snapshot and not rel.startswith(".agent_memory"):
+                p.unlink()
+                restored.append(f"-{rel}")
+        return restored
+
+    # ---------- 产物应用 ----------
+
+    def _apply_changes(self, gen) -> tuple[list[str], list[dict]]:
+        applied: list[str] = []
+        failures: list[dict] = []
+        for f in gen.files:
+            if not f.path or ".." in f.path:
+                continue
+            target = self.repo / f.path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f.content, encoding="utf-8")
+            applied.append(f.path)
+        if gen.patches:
+            pr = apply_patch_ops(self.repo, gen.patches)
+            applied.extend(pr.applied)
+            failures.extend(pr.failures)
+        return applied, failures
+
+    # ---------- 主循环 ----------
+
     def run(self, task: str) -> AgentReport:
-        # 0) 证据门: 任务前基准
         before = self.verifier.verify()
         baseline = before.benchmark_after
+        snapshot = self._snapshot()
         report = AgentReport(task=task)
         report.verify.benchmark_before = baseline
         report.lessons_recalled = self.memory.recall(task)
@@ -83,8 +149,6 @@ class CodeAgent:
         for r in range(1, self.max_rounds + 1):
             report.rounds = r
             ctx = self._context(task, r, last_result)
-            if ctx.get("lessons"):
-                pass  # 教训通过 memory.recall 已注入 generator 端
             try:
                 gen = self.generator.generate(task, ctx)
             except Exception as e:  # 生成失败也是失败, 记录教训
@@ -95,17 +159,30 @@ class CodeAgent:
                 continue
 
             report.plan = gen.plan or report.plan
-            applied = self._apply_files(gen)
+            applied, patch_failures = self._apply_changes(gen)
             report.files_changed.extend(applied)
+            for pf in patch_failures:  # patch 失败 → 教训 (old 不匹配是高频错误)
+                self.memory.record(task, f"patch_no_match:{pf.get('path')}",
+                                   f"old 片段与文件不符: {pf.get('reason')}")
 
             result = self.verifier.verify(before=baseline)
             report.verify = result
-            report.rounds_log.append({
+            round_log: dict = {
                 "round": r, "action": "verify",
                 "passed": result.passed, "failed": result.failed, "errors": result.errors,
                 "benchmark": result.benchmark_after,
-            })
-            if result.ok:
+            }
+            # Capability gate: 分数低于起点 → 回滚本轮 (越修越坏不留存)
+            if self.auto_rollback and result.benchmark_after < baseline - 1e-9:
+                restored = self._restore(snapshot)
+                round_log["action"] = "rollback"
+                round_log["restored"] = restored
+                round_log["benchmark_after_rollback"] = baseline
+                self.memory.record(task, f"benchmark_regressed:{result.benchmark_after}",
+                                   "分数不升即回滚: 修改被撤销")
+                report.rollback = True
+            report.rounds_log.append(round_log)
+            if result.ok and not round_log.get("restored"):
                 report.ok = True
                 break
             # 失败 → 提取症状, 记录教训
@@ -115,19 +192,14 @@ class CodeAgent:
             report.lessons_recorded += 1
             last_result = result
 
-        report.verify.benchmark_after = (last_result or report.verify).benchmark_after
+        # 最终 gate: 分数不升即回滚 (无论 ok 与否 — ok 但分数降同样回滚)
+        if self.auto_rollback and \
+                report.verify.benchmark_after < baseline - 1e-9:
+            self._restore(snapshot)
+            report.rollback = True
+            report.ok = False
+            report.verify.benchmark_after = baseline
         return report
-
-    def _apply_files(self, gen) -> list[str]:
-        applied: list[str] = []
-        for f in gen.files:
-            if not f.path or ".." in f.path:
-                continue
-            target = self.repo / f.path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(f.content, encoding="utf-8")
-            applied.append(f.path)
-        return applied
 
     @staticmethod
     def _symptom(result: VerifyResult) -> str:
