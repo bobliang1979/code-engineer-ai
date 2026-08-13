@@ -34,9 +34,11 @@ class Generator:
 class HermesGenerator(Generator):
     """真实 LLM 后端: 通过 `hermes chat -q` 路由到当前 provider, 零 API key。"""
 
-    def __init__(self, model: str | None = None, timeout: int = 180):
+    def __init__(self, model: str | None = None, timeout: int = 180,
+                 retries: int = 2):
         self.model = model
         self.timeout = timeout
+        self.retries = retries
 
     def _call(self, prompt: str) -> str:
         # -t "" 禁用子会话工具: 生成器只能输出文本, 绝不能自己改文件
@@ -44,21 +46,31 @@ class HermesGenerator(Generator):
         cmd = ["hermes", "chat", "-q", prompt, "-Q", "-t", ""]
         if self.model:
             cmd.extend(["-m", self.model])
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=self.timeout,
-            encoding="utf-8", errors="replace",
-        )
-        out = result.stdout.strip()
-        # 剥离子会话插件日志行 ([conscious-engine] / [unified-bridge] / 无括号追踪等)
-        lines = [ln for ln in out.splitlines()
-                 if not re.match(r"^\[[a-zA-Z][a-zA-Z-]*(?:\s[^\]]*)?\]\s", ln.strip())
-                 and not ln.strip().startswith("插件工具失败追踪")]
-        out = "\n".join(lines).strip()
-        if out.startswith("session_id:"):
-            out = "\n".join(out.split("\n")[1:]).strip()
-        if result.returncode != 0 and not out:
-            raise RuntimeError(f"hermes CLI failed: {result.stderr.strip()[:500]}")
-        return out
+        last_err: Exception | None = None
+        for i in range(self.retries + 1):
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=self.timeout,
+                    encoding="utf-8", errors="replace",
+                )
+                out = result.stdout.strip()
+                # 剥离子会话插件日志行 ([conscious-engine] / [unified-bridge] / 无括号追踪等)
+                lines = [ln for ln in out.splitlines()
+                         if not re.match(r"^\[[a-zA-Z][a-zA-Z-]*(?:\s[^\]]*)?\]\s", ln.strip())
+                         and not ln.strip().startswith("插件工具失败追踪")]
+                out = "\n".join(lines).strip()
+                if out.startswith("session_id:"):
+                    out = "\n".join(out.split("\n")[1:]).strip()
+                if result.returncode != 0 and not out:
+                    raise RuntimeError(
+                        f"hermes CLI failed: {result.stderr.strip()[:500]}")
+                return out
+            except (subprocess.TimeoutExpired, OSError, RuntimeError) as e:
+                last_err = e
+                import time
+                time.sleep(3 * (i + 1))  # 退避重试: 网络抖动自愈
+        raise RuntimeError(
+            f"hermes CLI failed after {self.retries + 1} tries: {last_err}")
 
     @staticmethod
     def _parse_files(content: str) -> list[GeneratedFile]:
@@ -84,6 +96,14 @@ class HermesGenerator(Generator):
             prompt_parts.append(
                 "LESSONS FROM PAST FAILURES (avoid repeating these mistakes):\n"
                 + json.dumps(lessons, ensure_ascii=False, indent=1)
+            )
+        pf = context.get("patch_failures") or []
+        if pf:
+            prompt_parts.append(
+                "PREVIOUS PATCH FAILED — your `old` fragment did not match the "
+                "file. The CURRENT file content is provided below: craft `old` to "
+                "match it EXACTLY (byte-for-byte, including quotes/spacing):\n"
+                + json.dumps(pf, ensure_ascii=False, indent=1)
             )
         prompt_parts.append(
             "Respond with:\n"

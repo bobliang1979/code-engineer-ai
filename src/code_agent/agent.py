@@ -63,6 +63,8 @@ class CodeAgent:
         self.max_rounds = max_rounds
         self.verifier = verifier or Verifier(self.repo)
         self.auto_rollback = auto_rollback
+        # self-healing patch: 记录 patch 失败的文件, 下一轮回传其内容供精确匹配
+        self._patch_failures: dict[str, str] = {}
 
     # ---------- 上下文 ----------
 
@@ -76,6 +78,15 @@ class CodeAgent:
         ]
         # NFWST: 历史失败教训注入下一轮生成 (修复: 此前 lessons 从未进上下文)
         ctx["lessons"] = self.memory.recall(task)
+        # self-healing patch: 上一轮 patch 失败的文件 → 回传当前内容供精确 old 匹配
+        if self._patch_failures:
+            ctx["patch_failures"] = [
+                {"path": p, "reason": r,
+                 "current_content": (self.repo / p).read_text(
+                     encoding="utf-8", errors="replace")[:2000]
+                 if (self.repo / p).exists() else ""}
+                for p, r in self._patch_failures.items()
+            ]
         if last_result:
             ctx["last_verification"] = {
                 "passed": last_result.passed, "failed": last_result.failed,
@@ -161,9 +172,10 @@ class CodeAgent:
             report.plan = gen.plan or report.plan
             applied, patch_failures = self._apply_changes(gen)
             report.files_changed.extend(applied)
-            for pf in patch_failures:  # patch 失败 → 教训 (old 不匹配是高频错误)
+            for pf in patch_failures:  # patch 失败 → 教训 + self-healing 回传
                 self.memory.record(task, f"patch_no_match:{pf.get('path')}",
                                    f"old 片段与文件不符: {pf.get('reason')}")
+                self._patch_failures[pf["path"]] = pf.get("reason", "old_not_found")
 
             result = self.verifier.verify(before=baseline)
             report.verify = result

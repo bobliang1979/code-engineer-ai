@@ -72,7 +72,24 @@ tests/test_llm.py        — 2: 协议块与文件块区分 (回归: patch JSON 
 3. **patch 块误解析**: `_parse_files` 把 ```patch JSON 块当整文件创建 "patch" 垃圾文件。
    修复: 排除协议块 + 回归测试。
 
-### 4.4 已知限制 (诚实标注)
+### 4.4 多轮真实难题 + self-healing patch (v0.4, 2026-08-13)
+
+构造: 信息盲区型难题 — `config.py` 用单引号非常规风格, LLM 上下文只有文件
+列表无内容, old 盲猜必不匹配 (引号风格猜不中)。
+
+```
+修复前: pytest 1 passed / 1 failed
+run#1 (无 self-healing): rounds=3 全败, ok=False — LLM 策略逐轮收敛
+  (整文件猜测 → 最小子串) 但引号盲区无法跨越; 教训召回确实生效
+  (第三轮 plan 引用前两轮 patch_no_match)
+run#2 (self-healing): round1 patch 失败 → 文件内容回传 →
+  round2 精确匹配 → pytest 2 passed, ok=True
+```
+
+反例 (同样有价值): tab 缩进陷阱与歧义 body 陷阱均被 LLM 一轮攻破 —
+真实 LLM 会主动用最小唯一子串 / def 行锚点规避歧义, 表现出人类级前瞻。
+
+### 4.5 已知限制 (诚实标注)
 
 - **coverage 是代理指标**: 函数名引用率, 非真实行覆盖 (不引 coverage.py)。
 - **单仓库串行**: 当前一轮处理一个 repo, 无多仓库编排/并发。
@@ -81,9 +98,8 @@ tests/test_llm.py        — 2: 协议块与文件块区分 (回归: patch JSON 
 
 ## 5. 下一步 (Roadmap v0.4)
 
-1. **多轮真实难题基准**: 构造必须 ≥2 轮的任务集 (第一轮必然引入新回归), 实测教训
-   召回对第二轮成功率的量化提升 (Δ 需机器可证)。
-2. **文件级回滚**: 快照按文件粒度, 支持部分保留 (修好 A 坏 B 时只回滚 B)。
-3. **补丁上下文增强**: patch 的 old 匹配失败时, 自动将文件当前相关片段回传 LLM 生成
-   精确 old (self-healing patch)。
-4. **能力分驱动技能沉淀**: benchmark 降维归因 (哪一维拖后腿) → 自动生成对应失败教训。
+✅ **多轮真实难题基准** (done): 信息盲区型难题构造方法论 + 反例 ×2 + Δ 证据
+✅ **self-healing patch** (done): patch old 失败 → 下轮回传文件内容 → 精确匹配;
+   测试 test_self_healing_patch_content_roundtrip; 生成器加重试 (网络抖动自愈)
+☐ **文件级回滚**: 快照按文件粒度, 支持部分保留 (修好 A 坏 B 时只回滚 B)
+☐ **能力分降维归因**: benchmark 降维归因 (哪一维拖后腿) → 自动生成对应失败教训

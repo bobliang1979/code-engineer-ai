@@ -109,3 +109,35 @@ def test_rollback_when_score_drops(tmp_path):
         encoding="utf-8").strip().endswith("return a + b")  # 原文件无损
     # 分数恢复起点
     assert report.verify.benchmark_after == report.verify.benchmark_before
+
+
+class FailingPatchGen(Generator):
+    """第一轮 old 不匹配 (盲猜); 第二轮若 context 携带文件内容 → 精确 old 修复。"""
+
+    def __init__(self):
+        self.calls = 0
+        self.ctx_with_content = False
+
+    def generate(self, task: str, context: dict) -> Generation:
+        self.calls += 1
+        if context.get("patch_failures"):
+            self.ctx_with_content = True
+            ops = [PatchOp(path="src/calc.py",
+                           old="def add(a, b):\n    return a - b\n",
+                           new="def add(a, b):\n    return a + b\n")]
+        else:
+            ops = [PatchOp(path="src/calc.py", old="return a+b", new="x")]  # 必失败
+        return Generation(plan=f"plan-{self.calls}", patches=ops)
+
+
+def test_self_healing_patch_content_roundtrip(tmp_path):
+    """patch old 不匹配 → 下一轮 context 回传文件内容 → 精确匹配修复 (v0.4 #3)。"""
+    repo = _repo(tmp_path, bad=True)
+    gen = FailingPatchGen()
+    report = CodeAgent(repo, gen, max_rounds=3).run("修复 add")
+
+    assert gen.calls == 2
+    assert gen.ctx_with_content is True          # 文件内容确实回传
+    assert report.ok is True                     # self-healing 闭环成功
+    assert (repo / "src" / "calc.py").read_text(
+        encoding="utf-8").strip().endswith("return a + b")
